@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Chatbot Starter</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <main class="app">
+      <div class="topbar">
+        <div>
+          <h1>Chatbot Starter</h1>
+          <p class="sub">Type a message and chat.</p>
+        </div>
+        <div class="actions">
+          <button id="history-btn" type="button" class="ghost">History</button>
+          <button id="new-chat" type="button" class="ghost">New chat</button>
+          <button id="clear-chat" type="button" class="ghost">Clear chat</button>
+        </div>
+      </div>
+
+      <p id="status" class="status">Ready</p>
+
+      <section id="chat" class="chat"></section>
+
+      <form id="chat-form" class="composer">
+        <button id="attach-btn" type="button" class="ghost icon-btn" title="Attach files">+</button>
+        <input id="file-input" type="file" multiple hidden />
+        <input id="message" type="text" placeholder="Ask something..." autocomplete="off" required />
+        <button id="voice-btn" type="button" class="ghost">Mic</button>
+        <button id="send-btn" type="submit">Send</button>
+      </form>
+      <div id="attachment-list" class="attachment-list"></div>
+    </main>
+
+    <aside id="history-panel" class="history-panel hidden" aria-hidden="true">
+      <div class="history-header">
+        <h2>Previous Chats</h2>
+        <button id="close-history" type="button" class="ghost">Close</button>
+      </div>
+      <div id="history-list" class="history-list"></div>
+    </aside>
+
+    <script>
+      const chatEl = document.getElementById("chat");
+      const formEl = document.getElementById("chat-form");
+      const messageEl = document.getElementById("message");
+      const attachBtn = document.getElementById("attach-btn");
+      const fileInput = document.getElementById("file-input");
+      const attachmentListEl = document.getElementById("attachment-list");
+      const clearBtn = document.getElementById("clear-chat");
+      const newChatBtn = document.getElementById("new-chat");
+      const historyBtn = document.getElementById("history-btn");
+      const closeHistoryBtn = document.getElementById("close-history");
+      const historyPanel = document.getElementById("history-panel");
+      const historyListEl = document.getElementById("history-list");
+      const voiceBtn = document.getElementById("voice-btn");
+      const sendBtn = document.getElementById("send-btn");
+      const statusEl = document.getElementById("status");
+
+      const STORAGE_KEY = "chatbot_sessions_v1";
+      const CURRENT_KEY = "chatbot_current_session_v1";
+      const sessions = [];
+      let currentSessionId = "";
+      let isLoading = false;
+      let recognition = null;
+      let isListening = false;
+      let pendingAttachments = [];
+
+      function nowTime() {
+        return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      }
+
+      function nowIso() {
+        return new Date().toISOString();
+      }
+
+      function fmtShortDate(iso) {
+        const d = new Date(iso);
+        return d.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+      }
+
+      function createSession() {
+        const id = `s_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+        const session = {
+          id,
+          title: "New chat",
+          createdAt: nowIso(),
+          updatedAt: nowIso(),
+          messages: [],
+        };
+        sessions.unshift(session);
+        currentSessionId = id;
+        saveStore();
+        return session;
+      }
+
+      function getCurrentSession() {
+        let session = sessions.find((x) => x.id === currentSessionId);
+        if (!session) {
+          session = createSession();
+        }
+        return session;
+      }
+
+      function saveStore() {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+        localStorage.setItem(CURRENT_KEY, currentSessionId);
+      }
+
+      function setLoading(value) {
+        isLoading = value;
+        messageEl.disabled = value;
+        sendBtn.disabled = value;
+        voiceBtn.disabled = value;
+        attachBtn.disabled = value;
+        statusEl.textContent = value ? "Thinking..." : "Ready";
+      }
+
+      function renderPendingAttachments() {
+        attachmentListEl.innerHTML = "";
+        if (!pendingAttachments.length) return;
+
+        for (let i = 0; i < pendingAttachments.length; i += 1) {
+          const file = pendingAttachments[i];
+          const chip = document.createElement("div");
+          chip.className = "attach-chip";
+
+          const label = document.createElement("span");
+          label.textContent = file.name;
+
+          const removeBtn = document.createElement("button");
+          removeBtn.type = "button";
+          removeBtn.className = "chip-remove";
+          removeBtn.textContent = "x";
+          removeBtn.addEventListener("click", () => {
+            pendingAttachments.splice(i, 1);
+            renderPendingAttachments();
+          });
+
+          chip.appendChild(label);
+          chip.appendChild(removeBtn);
+          attachmentListEl.appendChild(chip);
+        }
+      }
+
+      function clearPendingAttachments() {
+        pendingAttachments = [];
+        renderPendingAttachments();
+      }
+
+      async function uploadSelectedFiles(files) {
+        if (!files || !files.length) return;
+
+        const form = new FormData();
+        for (const file of files) {
+          form.append("files", file);
+        }
+
+        statusEl.textContent = "Uploading files...";
+        try {
+          const response = await fetch("/upload", {
+            method: "POST",
+            body: form,
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            statusEl.textContent = data.error || "File upload failed";
+            return;
+          }
+
+          const uploaded = Array.isArray(data.files) ? data.files : [];
+          for (const item of uploaded) {
+            if (item.error) continue;
+            pendingAttachments.push(item);
+          }
+
+          renderPendingAttachments();
+          statusEl.textContent = uploaded.length ? "Files attached" : "No valid files selected";
+        } catch {
+          statusEl.textContent = "File upload failed";
+        }
+      }
+
+      function setupSpeechRecognition() {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SpeechRecognition) {
+          voiceBtn.disabled = true;
+          voiceBtn.title = "Speech recognition is not supported in this browser";
+          return;
+        }
+
+        recognition = new SpeechRecognition();
+        recognition.lang = "en-US";
+        recognition.interimResults = true;
+        recognition.continuous = false;
+
+        recognition.onstart = () => {
+          isListening = true;
+          voiceBtn.textContent = "Stop";
+          voiceBtn.classList.add("listening");
+          statusEl.textContent = "Listening...";
+        };
+
+        recognition.onresult = (event) => {
+          let transcript = "";
+          for (let i = event.resultIndex; i < event.results.length; i += 1) {
+            transcript += event.results[i][0].transcript;
+          }
+          messageEl.value = transcript.trim();
+        };
+
+        recognition.onerror = () => {
+          statusEl.textContent = "Voice input failed. Try again.";
+        };
+
+        recognition.onend = () => {
+          isListening = false;
+          voiceBtn.textContent = "Mic";
+          voiceBtn.classList.remove("listening");
+          if (!isLoading) {
+            statusEl.textContent = "Ready";
+          }
+        };
+
+        voiceBtn.addEventListener("click", () => {
+          if (isLoading) return;
+          if (isListening) {
+            recognition.stop();
+            return;
+          }
+          messageEl.focus();
+          recognition.start();
+        });
+      }
+
+      function addMessageToView(role, text, ts = nowTime(), scroll = true, typing = false) {
+        const item = document.createElement("div");
+        item.className = `msg ${role}`;
+        if (typing) {
+          item.classList.add("typing");
+        }
+
+        const header = document.createElement("div");
+        header.className = "meta";
+        header.textContent = `${role === "user" ? "You" : "Bot"} - ${ts}`;
+
+        const body = document.createElement("div");
+        body.className = "text";
+        body.textContent = text;
+
+        item.appendChild(header);
+        item.appendChild(body);
+        chatEl.appendChild(item);
+
+        if (scroll) {
+          chatEl.scrollTop = chatEl.scrollHeight;
+        }
+        return { item, body };
+      }
+
+      function renderCurrentSession() {
+        const session = getCurrentSession();
+        chatEl.innerHTML = "";
+        for (const msg of session.messages) {
+          addMessageToView(msg.role, msg.content, msg.ts || nowTime(), false, false);
+        }
+        chatEl.scrollTop = chatEl.scrollHeight;
+      }
+
+      function deriveTitle(session) {
+        const firstUser = session.messages.find((m) => m.role === "user");
+        if (!firstUser || !firstUser.content) return "New chat";
+        const raw = firstUser.content.trim();
+        return raw.length > 42 ? `${raw.slice(0, 42)}...` : raw;
+      }
+
+      function renderHistoryList() {
+        historyListEl.innerHTML = "";
+
+        if (!sessions.length) {
+          const empty = document.createElement("p");
+          empty.className = "history-empty";
+          empty.textContent = "No previous chats yet.";
+          historyListEl.appendChild(empty);
+          return;
+        }
+
+        for (const session of sessions) {
+          const card = document.createElement("button");
+          card.type = "button";
+          card.className = "history-item";
+          if (session.id === currentSessionId) {
+            card.classList.add("active");
+          }
+
+          const title = document.createElement("div");
+          title.className = "history-title";
+          title.textContent = session.title || "New chat";
+
+          const meta = document.createElement("div");
+          meta.className = "history-meta";
+          meta.textContent = `${session.messages.length} msgs - ${fmtShortDate(session.updatedAt || session.createdAt)}`;
+
+          card.appendChild(title);
+          card.appendChild(meta);
+
+          card.addEventListener("click", () => {
+            currentSessionId = session.id;
+            saveStore();
+            renderCurrentSession();
+            renderHistoryList();
+            setHistoryOpen(false);
+            statusEl.textContent = "Loaded chat from history";
+          });
+
+          historyListEl.appendChild(card);
+        }
+      }
+
+      function setHistoryOpen(open) {
+        historyPanel.classList.toggle("hidden", !open);
+        historyPanel.setAttribute("aria-hidden", String(!open));
+      }
+
+      function pushMessage(role, content, ts) {
+        const session = getCurrentSession();
+        session.messages.push({ role, content, ts });
+        session.updatedAt = nowIso();
+        session.title = deriveTitle(session);
+        saveStore();
+        renderHistoryList();
+      }
+
+      function loadStore() {
+        try {
+          const raw = localStorage.getItem(STORAGE_KEY);
+          const parsed = raw ? JSON.parse(raw) : [];
+          if (Array.isArray(parsed)) {
+            for (const s of parsed) {
+              if (!s || !s.id || !Array.isArray(s.messages)) continue;
+              sessions.push({
+                id: s.id,
+                title: s.title || "New chat",
+                createdAt: s.createdAt || nowIso(),
+                updatedAt: s.updatedAt || s.createdAt || nowIso(),
+                messages: s.messages.filter((m) => m && (m.role === "user" || m.role === "assistant") && m.content),
+              });
+            }
+          }
+
+          currentSessionId = localStorage.getItem(CURRENT_KEY) || "";
+          if (!sessions.length) {
+            createSession();
+          } else if (!sessions.some((x) => x.id === currentSessionId)) {
+            currentSessionId = sessions[0].id;
+          }
+
+          saveStore();
+        } catch {
+          sessions.length = 0;
+          createSession();
+          statusEl.textContent = "Could not read old history; started fresh";
+        }
+      }
+
+      formEl.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (isLoading) return;
+
+        const message = messageEl.value.trim();
+        if (!message) return;
+
+        const userTs = nowTime();
+        addMessageToView("user", message, userTs);
+        pushMessage("user", message, userTs);
+
+        messageEl.value = "";
+        setLoading(true);
+
+        const botTs = nowTime();
+        const botView = addMessageToView("bot", "", botTs, true, true);
+
+        try {
+          const session = getCurrentSession();
+          const apiHistory = session.messages
+            .slice(0, -1)
+            .map((m) => ({ role: m.role, content: m.content }));
+
+          const response = await fetch("/chat/stream", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message, history: apiHistory, attachments: pendingAttachments }),
+          });
+
+          if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            botView.body.textContent = data.error || "Request failed.";
+            botView.item.classList.remove("typing");
+            return;
+          }
+
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let reply = "";
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            reply += decoder.decode(value, { stream: true });
+            botView.body.textContent = reply;
+            chatEl.scrollTop = chatEl.scrollHeight;
+          }
+
+          const finalReply = reply.trim() || "No reply.";
+          botView.body.textContent = finalReply;
+          botView.item.classList.remove("typing");
+          pushMessage("assistant", finalReply, botTs);
+          clearPendingAttachments();
+        } catch {
+          botView.body.textContent = "Network error.";
+          botView.item.classList.remove("typing");
+        } finally {
+          setLoading(false);
+          messageEl.focus();
+        }
+      });
+
+      clearBtn.addEventListener("click", () => {
+        const session = getCurrentSession();
+        session.messages = [];
+        session.title = "New chat";
+        session.updatedAt = nowIso();
+        saveStore();
+        renderCurrentSession();
+        renderHistoryList();
+        clearPendingAttachments();
+        statusEl.textContent = "Current chat cleared";
+      });
+
+      newChatBtn.addEventListener("click", () => {
+        createSession();
+        renderCurrentSession();
+        renderHistoryList();
+        clearPendingAttachments();
+        statusEl.textContent = "Started a new chat";
+        messageEl.focus();
+      });
+
+      attachBtn.addEventListener("click", () => {
+        if (isLoading) return;
+        fileInput.click();
+      });
+
+      fileInput.addEventListener("change", async () => {
+        const selected = Array.from(fileInput.files || []);
+        fileInput.value = "";
+        await uploadSelectedFiles(selected);
+      });
+
+      historyBtn.addEventListener("click", () => {
+        renderHistoryList();
+        setHistoryOpen(true);
+      });
+
+      closeHistoryBtn.addEventListener("click", () => {
+        setHistoryOpen(false);
+      });
+
+      loadStore();
+      renderCurrentSession();
+      renderHistoryList();
+      setupSpeechRecognition();
+      messageEl.focus();
+    </script>
+  </body>
+</html>
